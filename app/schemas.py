@@ -322,3 +322,66 @@ class AliquotCreate(BaseModel):
         if dup:
             raise ValueError(f"子样本编号在本次请求中重复：{'、'.join(sorted(dup))}")
         return self
+
+
+# ---------- 样本库位管理 ----------
+
+
+class LocationCreate(BaseModel):
+    """创建库位：编号全局唯一，容量为正整数。"""
+
+    code: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=128)
+    capacity: int = Field(..., ge=1, le=1000000)
+
+    @field_validator("code", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+
+class LocationMoveCreate(BaseModel):
+    """样本库位移动：放入（源为 null）、库位间转移或移出（目标为 null）。
+
+    必须携带样本与源 / 目标库位的当前版本（乐观锁）；服务端在单一
+    ``BEGIN IMMEDIATE`` 事务内校验样本当前库位、目标剩余容量与全部版本，
+    并发争抢最后空位、陈旧来源或版本过期均返回 409。
+    """
+
+    to_location_id: Optional[int] = Field(None, ge=1)
+    operator: str = Field(..., min_length=1, max_length=64)
+    moved_at: Optional[str] = None
+    note: str = Field("", max_length=512)
+    expected_sample_version: int = Field(..., ge=0)
+    expected_from_location_id: Optional[int] = Field(None, ge=1)
+    expected_from_version: Optional[int] = Field(None, ge=0)
+    expected_to_version: Optional[int] = Field(None, ge=0)
+
+    @field_validator("operator")
+    @classmethod
+    def _strip_operator(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("操作人不能为空")
+        return v
+
+    @field_validator("moved_at")
+    @classmethod
+    def _norm_moved_at(cls, v):
+        return _normalize_time(v, "移动时间")
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _check_versions(self) -> "LocationMoveCreate":
+        if self.to_location_id is not None and self.expected_to_version is None:
+            raise ValueError("转移到目标库位时必须携带 expected_to_version")
+        if self.expected_from_location_id is not None and self.expected_from_version is None:
+            raise ValueError("样本当前在库位中时必须携带 expected_from_version")
+        return self

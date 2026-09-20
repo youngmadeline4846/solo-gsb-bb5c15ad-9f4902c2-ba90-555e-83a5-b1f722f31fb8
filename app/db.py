@@ -242,6 +242,53 @@ CREATE TABLE IF NOT EXISTS aliquot_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_aliquot_items_batch ON aliquot_items(batch_id);
+
+-- 样本库位管理：库位带全局唯一编号与容量；occupied 为在转移事务内维护的
+-- 当前占用数（CHECK 兜底不为负），version 为库位级乐观锁，每次占用变化 +1。
+CREATE TABLE IF NOT EXISTS locations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT    NOT NULL UNIQUE,
+    name       TEXT    NOT NULL,
+    capacity   INTEGER NOT NULL CHECK (capacity > 0),
+    occupied   INTEGER NOT NULL DEFAULT 0 CHECK (occupied >= 0),
+    version    INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL
+);
+
+-- 样本当前所在库位：sample_id 为主键，保证每个样本最多占一个库位。
+-- 不加 ON DELETE CASCADE：删除样本前应用层要求先移出库位（409），
+-- 外键 RESTRICT 兜底，避免占用计数静默失真。
+CREATE TABLE IF NOT EXISTS sample_placements (
+    sample_id   INTEGER PRIMARY KEY REFERENCES samples(id),
+    location_id INTEGER NOT NULL REFERENCES locations(id),
+    placed_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_placements_location ON sample_placements(location_id);
+
+-- 不可变移动记录：放入（from 为 NULL）、库位间转移与移出（to 为 NULL）
+-- 一经写入即不可修改、不可删除（应用层不提供更新 / 删除接口）。
+-- 样本 / 库位编号以快照随记录保存；样本 id 不加外键，样本删除后历史仍可查。
+CREATE TABLE IF NOT EXISTS location_moves (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id             INTEGER NOT NULL,
+    sample_code           TEXT    NOT NULL,
+    from_location_id      INTEGER,
+    from_code             TEXT,
+    to_location_id        INTEGER,
+    to_code               TEXT,
+    operator              TEXT    NOT NULL,
+    moved_at              TEXT    NOT NULL,
+    note                  TEXT    NOT NULL DEFAULT '',
+    sample_version_before INTEGER NOT NULL,
+    from_version_before   INTEGER,
+    to_version_before     INTEGER,
+    created_at            TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_location_moves_sample ON location_moves(sample_id);
+CREATE INDEX IF NOT EXISTS idx_location_moves_to ON location_moves(to_location_id);
+CREATE INDEX IF NOT EXISTS idx_location_moves_from ON location_moves(from_location_id);
 -- idx_samples_parent 在 _migrate() 补齐谱系列之后创建（旧库该列尚不存在）
 """
 
@@ -355,6 +402,37 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
 
     _seed_handovers(conn, sid, event_ids, rows, sid2, event_ids2, rows2, now)
     _seed_lineage(conn, sid, now)
+    _seed_locations(conn, sid2, "SAM-DEMO-002", now)
+
+
+def _seed_locations(conn: sqlite3.Connection, sample_id: int, sample_code: str, now: str) -> None:
+    """预置两个演示库位，并把无缝链路样本放入其一（含一条初始入库移动记录）。"""
+    loc_a = conn.execute(
+        "INSERT INTO locations (code, name, capacity, occupied, version, created_at) "
+        "VALUES (?, ?, ?, 0, 0, ?)",
+        ("LOC-A-01", "冷藏柜 A-1（2-8℃）", 8, now),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO locations (code, name, capacity, occupied, version, created_at) "
+        "VALUES (?, ?, ?, 0, 0, ?)",
+        ("LOC-B-02", "冷冻柜 B-2（-20℃）", 4, now),
+    )
+    # 初始入库：占用数、样本当前位置、样本版本与移动记录在同一事务内一致写入
+    conn.execute(
+        "INSERT INTO sample_placements (sample_id, location_id, placed_at) VALUES (?, ?, ?)",
+        (sample_id, loc_a, now),
+    )
+    conn.execute(
+        "UPDATE locations SET occupied = 1, version = 1 WHERE id = ?", (loc_a,)
+    )
+    conn.execute("UPDATE samples SET version = version + 1 WHERE id = ?", (sample_id,))
+    conn.execute(
+        "INSERT INTO location_moves (sample_id, sample_code, from_location_id, from_code, "
+        "to_location_id, to_code, operator, moved_at, note, sample_version_before, "
+        "from_version_before, to_version_before, created_at) "
+        "VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, 0, NULL, 0, ?)",
+        (sample_id, sample_code, loc_a, "LOC-A-01", "赵六（留样管理员）", now, "初始入库", now),
+    )
 
 
 def _seed_lineage(conn: sqlite3.Connection, sid: int, now: str) -> None:

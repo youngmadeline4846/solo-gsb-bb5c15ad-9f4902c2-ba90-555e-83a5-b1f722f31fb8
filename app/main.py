@@ -1,4 +1,4 @@
-"""FastAPI 入口：样本 / 交接事件 CRUD、审计、结论签署与报告导出。"""
+"""FastAPI 入口：样本 / 交接事件 CRUD、审计、结论签署与报告导出、样本库位管理。"""
 from __future__ import annotations
 
 import hashlib
@@ -71,6 +71,15 @@ from .handovers import (
     get_handover_record,
     refresh_handover_validity,
 )
+from .locations import (
+    LocationError,
+    create_location,
+    current_placement,
+    get_location_detail,
+    list_locations,
+    list_sample_moves,
+    move_sample,
+)
 from .report import build_html, build_json, build_markdown
 from .seal_package import (
     SealPackageError,
@@ -86,6 +95,8 @@ from .schemas import (
     FindingDispose,
     FindingRelease,
     HandoverConfirm,
+    LocationCreate,
+    LocationMoveCreate,
     SampleCreate,
     SampleQuantityInit,
     SignoffCreate,
@@ -188,6 +199,8 @@ def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str
         "handovers": build_handover_view(conn, sample_id),
         "attachments": list_sample_attachments(conn, sample_id),
         "lineage": build_lineage_tree(conn, sample_id),
+        "location": current_placement(conn, sample_id),
+        "location_moves": list_sample_moves(conn, sample_id),
     }
 
 
@@ -205,6 +218,14 @@ def delete_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> Respo
     blocked = deletion_blocked_reason(conn, sample_id)
     if blocked:
         raise HTTPException(status_code=409, detail=blocked)
+    # 样本当前位于库位中时禁止删除：请先移出库位（库位占用计数须保持一致）
+    placement = current_placement(conn, sample_id)
+    if placement:
+        raise HTTPException(
+            status_code=409,
+            detail=f"样本当前位于库位 {placement['code']}（{placement['name']}），"
+                   "请先移出库位后再删除样本",
+        )
     conn.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
     conn.commit()
     return Response(status_code=204)
@@ -274,6 +295,77 @@ def get_aliquot_batch(batch_id: int, conn: Connection = Depends(get_conn)) -> di
         return get_batch_detail(conn, batch_id)
     except AliquotError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+# ---------- 样本库位管理 ----------
+
+@app.get("/api/locations")
+def list_locations_route(conn: Connection = Depends(get_conn)) -> list[dict[str, Any]]:
+    """库位列表：编号 / 名称 / 容量 / 当前占用 / 剩余 / 乐观锁版本。"""
+    return list_locations(conn)
+
+
+@app.post("/api/locations", status_code=201)
+def create_location_route(
+    payload: LocationCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """创建库位（编号全局唯一，容量为正整数）。"""
+    try:
+        return create_location(conn, payload.code, payload.name, payload.capacity)
+    except LocationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/locations/{location_id}")
+def get_location_route(location_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """库位详情：基本信息 + 当前占用清单 + 涉及该库位的移动历史。"""
+    try:
+        return get_location_detail(conn, location_id)
+    except LocationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/samples/{sample_id}/location-move", status_code=201)
+def move_sample_location(
+    sample_id: int, payload: LocationMoveCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """样本库位移动：放入（源为 null）、库位间转移或移出（目标为 null）。
+
+    在单一 ``BEGIN IMMEDIATE`` 事务内校验样本当前库位、目标剩余容量，以及
+    样本和源 / 目标库位的 ``expected_version``；成功后同步更新两侧占用数、
+    样本当前位置与版本，并写入不可变移动记录。并发争抢最后空位、陈旧来源
+    或版本过期均返回 409，失败整体回滚，不产生重复占位、超容量或半条记录。
+    """
+    try:
+        result = move_sample(
+            conn,
+            sample_id,
+            payload.to_location_id,
+            payload.operator,
+            expected_sample_version=payload.expected_sample_version,
+            expected_from_location_id=payload.expected_from_location_id,
+            expected_from_version=payload.expected_from_version,
+            expected_to_version=payload.expected_to_version,
+            moved_at=payload.moved_at,
+            note=payload.note,
+        )
+    except LocationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    # 回传刷新后的样本 / 当前位置 / 移动历史 / 库位列表，便于前端直接渲染
+    result["sample"] = _fetch_sample(conn, sample_id)
+    result["location"] = current_placement(conn, sample_id)
+    result["location_moves"] = list_sample_moves(conn, sample_id)
+    result["locations"] = list_locations(conn)
+    return result
+
+
+@app.get("/api/samples/{sample_id}/location-moves")
+def list_sample_location_moves(
+    sample_id: int, conn: Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """样本的移动历史（不可变记录，新的在前）。"""
+    _fetch_sample(conn, sample_id)
+    return list_sample_moves(conn, sample_id)
 
 
 # ---------- 交接事件 ----------

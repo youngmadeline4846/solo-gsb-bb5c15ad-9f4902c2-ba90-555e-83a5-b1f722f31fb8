@@ -30,6 +30,9 @@
         <span class="qe-icon">🚨</span> 异常处置队列
         <span id="queue-badge" class="queue-badge" hidden>0</span>
       </button>
+      <button id="btn-locations" class="queue-entry" type="button">
+        <span class="qe-icon">🗄</span> 样本库位管理
+      </button>
       <ul id="sample-list" class="sample-list"></ul>
     </aside>
 
@@ -115,6 +118,51 @@
         </section>
       </div>
 
+      <!-- 样本库位管理（跨样本视图） -->
+      <div id="locations-view" class="detail" hidden>
+        <section class="card">
+          <div class="card-head">
+            <h3>样本库位管理</h3>
+            <span class="head-hint">库位带唯一编号与容量；样本可放入 / 转移 / 移出，每个样本最多占一个库位；转移在单一事务内校验当前位置、剩余容量与版本，并发争抢或版本过期返回 409</span>
+          </div>
+          <form id="location-form" class="event-form">
+            <div class="form-grid form-grid-3">
+              <label>库位编号
+                <input type="text" id="loc-code" maxlength="64" placeholder="如：LOC-C-03" required />
+              </label>
+              <label>库位名称
+                <input type="text" id="loc-name" maxlength="128" placeholder="如：冷藏柜 C-3（2-8℃）" required />
+              </label>
+              <label>容量（个）
+                <input type="number" id="loc-capacity" min="1" max="1000000" step="1" placeholder="正整数，如 8" required />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">创建库位</button>
+              <button type="button" id="btn-loc-refresh" class="btn btn-ghost">↻ 刷新</button>
+            </div>
+          </form>
+          <div id="loc-stats" class="handover-stats"></div>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead>
+                <tr>
+                  <th>库位编号</th>
+                  <th>名称</th>
+                  <th>容量</th>
+                  <th>已占用</th>
+                  <th>剩余空位</th>
+                  <th>占用率</th>
+                  <th>版本</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="loc-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
       <div id="detail" class="detail" hidden>
         <!-- 样本信息卡 -->
         <section class="card sample-card">
@@ -192,6 +240,48 @@
           <div class="lin-tree-wrap">
             <div class="lin-tree-lbl">来源 / 批次 / 分装量 / 剩余量（点击样本可跳转继续分装；点击批次号查看不可变批次详情）</div>
             <div id="lin-tree" class="lin-tree"></div>
+          </div>
+        </section>
+
+        <!-- 样本库位 -->
+        <section class="card">
+          <div class="card-head">
+            <h3>样本库位</h3>
+            <span class="head-hint">每个样本最多占一个库位；放入 / 转移 / 移出在单一事务内校验当前位置、目标剩余容量与样本及库位版本，并发冲突返回 409 并自动刷新</span>
+          </div>
+          <div id="loc-current" class="lin-current"></div>
+          <form id="move-form" class="event-form">
+            <div class="form-grid form-grid-3">
+              <label>目标库位
+                <select id="mv-target"></select>
+                <small id="mv-target-hint">仅列出有空位的库位（不含当前所在库位）</small>
+              </label>
+              <label>操作人
+                <input type="text" id="mv-operator" maxlength="64" placeholder="如：留样管理员 赵六" required />
+              </label>
+              <label class="form-note">备注
+                <input type="text" id="mv-note" maxlength="512" placeholder="可选，如：复检后转入冷冻柜" />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" id="mv-submit" class="btn btn-primary">放入目标库位</button>
+              <button type="button" id="mv-checkout" class="btn btn-ghost" hidden>移出库位</button>
+            </div>
+          </form>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>移动时间</th>
+                  <th>从</th>
+                  <th>到</th>
+                  <th>操作人</th>
+                  <th>备注</th>
+                </tr>
+              </thead>
+              <tbody id="mv-history-tbody"></tbody>
+            </table>
           </div>
         </section>
 
@@ -614,6 +704,17 @@
       <div id="batch-detail-body" class="signoff-detail"></div>
       <div class="form-actions">
         <button type="button" id="btn-close-batch" class="btn btn-ghost">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 库位详情弹窗（占用清单 + 移动历史） -->
+  <div id="location-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <h3>库位详情</h3>
+      <div id="location-detail-body" class="signoff-detail"></div>
+      <div class="form-actions">
+        <button type="button" id="btn-close-location" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

@@ -7,11 +7,12 @@
   const state = {
     samples: [],
     currentId: null,
-    data: null, // { sample, events, audit, signoffs, handovers }
+    data: null, // { sample, events, audit, signoffs, handovers, location, location_moves }
+    locations: [],       // 库位列表缓存（目标库位下拉与乐观锁版本来源）
     editingId: null,
     viewSignoffId: null, // 当前弹窗中查看的签署快照 id
     confirmPair: null,   // 当前确认弹窗对应的交接项 { fromId, toId }
-    view: "sample",      // 主区域当前视图：sample（样本详情）| queue（异常处置队列）
+    view: "sample",      // 主区域当前视图：sample（样本详情）| queue（异常处置队列）| locations（库位管理）
     queue: {
       filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "", claim: "" },
       data: null,        // 最近一次队列响应
@@ -129,17 +130,19 @@
     loadQueueBadge(); // 未处理数角标随样本 / 链路变化刷新
   }
 
-  // 主区域视图切换：样本详情 <-> 异常处置队列（跨样本）
+  // 主区域视图切换：样本详情 <-> 异常处置队列 / 库位管理（跨样本）
   function setView(view) {
     state.view = view;
     $("#btn-queue").classList.toggle("active", view === "queue");
+    $("#btn-locations").classList.toggle("active", view === "locations");
     $("#queue-view").hidden = view !== "queue";
+    $("#locations-view").hidden = view !== "locations";
     if (view !== "queue") {
       // 离开队列视图时停止租约倒计时
       clearInterval(state.queue.countdownTimer);
       state.queue.countdownTimer = null;
     }
-    if (view === "queue") {
+    if (view === "queue" || view === "locations") {
       $("#detail").hidden = true;
       $("#empty-state").hidden = true;
       document
@@ -162,7 +165,12 @@
   async function selectSample(id) {
     try {
       state.currentId = id;
-      state.data = await api(`/api/samples/${id}`);
+      const [detail, locations] = await Promise.all([
+        api(`/api/samples/${id}`),
+        api("/api/locations"),
+      ]);
+      state.data = detail;
+      state.locations = locations;
       state.editingId = null;
       linState.rows = [];
       $("#aliquot-form").reset();
@@ -183,6 +191,7 @@
   function renderAll() {
     renderSample();
     renderLineage();
+    renderLocationCard();
     renderAudit();
     renderHandovers();
     renderTimeline();
@@ -1312,6 +1321,7 @@
     await loadSamples(state.currentId); // 事件数更新
     if (state.currentId) {
       state.data = await api(`/api/samples/${state.currentId}`);
+      state.locations = await api("/api/locations");
       renderAll();
     }
   }
@@ -1787,6 +1797,7 @@
 
   async function reloadCurrentSample(id) {
     state.data = await api(`/api/samples/${id}`);
+    state.locations = await api("/api/locations");
     linState.rows = [];
     renderAll();
     await loadSamples(id);
@@ -1927,6 +1938,305 @@
   $("#btn-close-batch").addEventListener("click", () => (batchModal.hidden = true));
   batchModal.addEventListener("click", (e) => {
     if (e.target === batchModal) batchModal.hidden = true;
+  });
+
+  // ---------- 样本库位管理 ----------
+
+  $("#btn-locations").addEventListener("click", () => {
+    setView("locations");
+    loadLocationsView();
+  });
+  $("#btn-loc-refresh").addEventListener("click", loadLocationsView);
+
+  async function loadLocationsView() {
+    try {
+      state.locations = await api("/api/locations");
+      renderLocationsView();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  function renderLocationsView() {
+    const locs = state.locations || [];
+    const totalCap = locs.reduce((a, l) => a + l.capacity, 0);
+    const totalOcc = locs.reduce((a, l) => a + l.occupied, 0);
+    $("#loc-stats").innerHTML = [
+      statChip(locs.length, "库位", ""),
+      statChip(totalCap, "总容量", ""),
+      statChip(totalOcc, "已占用", totalOcc ? "warn" : "muted"),
+      statChip(totalCap - totalOcc, "剩余空位", "ok"),
+    ].join("");
+
+    const tbody = $("#loc-tbody");
+    if (!locs.length) {
+      tbody.innerHTML = `<tr><td colspan="8" class="muted-cell" style="text-align:center;padding:22px">暂无库位，请在上方创建（编号唯一、容量为正整数）</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = locs
+      .map((l) => {
+        const pct = l.capacity ? Math.round((l.occupied / l.capacity) * 100) : 0;
+        const full = l.remaining <= 0;
+        return `
+        <tr>
+          <td><span class="s-code">${esc(l.code)}</span></td>
+          <td>${esc(l.name)}</td>
+          <td>${l.capacity}</td>
+          <td>${l.occupied}</td>
+          <td>${full ? '<span class="badge badge-fail">已满</span>' : l.remaining}</td>
+          <td><span class="loc-bar${full ? " full" : ""}"><i style="width:${pct}%"></i></span><span class="muted-cell">${pct}%</span></td>
+          <td class="muted-cell">v${l.version}</td>
+          <td><button class="link-btn btn-edit" data-loc-view="${l.id}">占用清单</button></td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  // 创建库位
+  $("#location-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload = {
+      code: $("#loc-code").value.trim(),
+      name: $("#loc-name").value.trim(),
+      capacity: Number($("#loc-capacity").value),
+    };
+    if (!payload.code || !payload.name) {
+      toast("请填写库位编号与名称", true);
+      return;
+    }
+    if (!Number.isInteger(payload.capacity) || payload.capacity < 1) {
+      toast("容量必须是正整数", true);
+      return;
+    }
+    try {
+      const loc = await api("/api/locations", { method: "POST", body: JSON.stringify(payload) });
+      toast(`库位 ${loc.code} 已创建（容量 ${loc.capacity}）`);
+      $("#location-form").reset();
+      await loadLocationsView();
+    } catch (err) {
+      toast(err.message, true);
+      if (err.status === 409) await loadLocationsView(); // 编号冲突：刷新列表
+    }
+  });
+
+  // 库位详情弹窗：占用清单 + 移动历史
+  $("#loc-tbody").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-loc-view]");
+    if (btn) openLocationDetail(Number(btn.dataset.locView));
+  });
+
+  async function openLocationDetail(id) {
+    try {
+      const d = await api(`/api/locations/${id}`);
+      const pct = d.capacity ? Math.round((d.occupied / d.capacity) * 100) : 0;
+      const occRows = d.occupants.length
+        ? d.occupants
+            .map(
+              (o, i) => `
+          <tr>
+            <td class="col-ord">${i + 1}</td>
+            <td><span class="s-code">${esc(o.code)}</span></td>
+            <td>${esc(o.name)}</td>
+            <td class="muted-cell">${esc(o.placed_at)}</td>
+            <td><button class="link-btn btn-edit" data-loc-go="${o.sample_id}">进入样本</button></td>
+          </tr>`
+            )
+            .join("")
+        : `<tr><td colspan="5" class="muted-cell" style="text-align:center;padding:16px">库位当前空闲</td></tr>`;
+      const moveRows = d.moves.length
+        ? d.moves
+            .map(
+              (m) => `
+          <tr>
+            <td>${esc(m.moved_at)}</td>
+            <td><span class="s-code">${esc(m.sample_code)}</span></td>
+            <td>${m.from_code ? esc(m.from_code) : '<span class="muted-cell">（未入库）</span>'} → ${
+              m.to_code ? esc(m.to_code) : '<span class="muted-cell">（移出库位）</span>'
+            }</td>
+            <td>${esc(m.operator)}</td>
+            <td>${esc(m.note || "—")}</td>
+          </tr>`
+            )
+            .join("")
+        : `<tr><td colspan="5" class="muted-cell" style="text-align:center;padding:16px">暂无移动记录</td></tr>`;
+      $("#location-detail-body").innerHTML = `
+        <div class="signoff-meta">
+          <div><span class="meta-lbl">库位编号</span><b>${esc(d.code)}</b></div>
+          <div><span class="meta-lbl">名称</span>${esc(d.name)}</div>
+          <div><span class="meta-lbl">占用</span><b>${d.occupied}</b> / ${d.capacity}（剩余 ${d.remaining}）
+            <span class="loc-bar${d.remaining <= 0 ? " full" : ""}"><i style="width:${pct}%"></i></span>${pct}%</div>
+          <div><span class="meta-lbl">版本</span>v${d.version}</div>
+          <div><span class="meta-lbl">创建时间</span>${esc(d.created_at)}</div>
+        </div>
+        <div class="signoff-section">
+          <h4>当前占用清单（${d.occupants.length} 个样本）</h4>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead><tr><th>#</th><th>样本编号</th><th>名称</th><th>放入时间</th><th>操作</th></tr></thead>
+              <tbody>${occRows}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="signoff-section">
+          <h4>移动历史（不可变记录，最近 ${d.moves.length} 条）</h4>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead><tr><th>移动时间</th><th>样本</th><th>从 → 到</th><th>操作人</th><th>备注</th></tr></thead>
+              <tbody>${moveRows}</tbody>
+            </table>
+          </div>
+        </div>`;
+      $("#location-modal").hidden = false;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  // 从库位详情直接进入样本
+  $("#location-detail-body").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-loc-go]");
+    if (!btn) return;
+    $("#location-modal").hidden = true;
+    await selectSample(Number(btn.dataset.locGo));
+  });
+
+  const locationModal = $("#location-modal");
+  $("#btn-close-location").addEventListener("click", () => (locationModal.hidden = true));
+  locationModal.addEventListener("click", (e) => {
+    if (e.target === locationModal) locationModal.hidden = true;
+  });
+
+  // ---- 样本详情页：库位卡片 ----
+
+  function renderLocationCard() {
+    const sample = curSample();
+    if (!sample) return;
+    const cur = state.data.location || null;
+    const locs = state.locations || [];
+
+    // 当前位置
+    $("#loc-current").innerHTML = cur
+      ? [
+          statChip(esc(cur.code), `当前库位 · ${esc(cur.name)}`, "ok"),
+          statChip(`v${sample.version}`, "样本版本", "muted"),
+          `<span class="ho-stat muted"><b>放入时间</b> ${esc(cur.placed_at)}</span>`,
+        ].join("")
+      : [
+          statChip("未入库", "当前位置", "warn"),
+          statChip(`v${sample.version}`, "样本版本", "muted"),
+          `<span class="ho-stat muted"><b>提示</b> 选择目标库位并填写操作人即可放入</span>`,
+        ].join("");
+
+    // 目标库位下拉：排除当前所在库位；已满库位禁用
+    const sel = $("#mv-target");
+    const candidates = locs.filter((l) => !cur || l.id !== cur.location_id);
+    sel.innerHTML = candidates.length
+      ? candidates
+          .map(
+            (l) =>
+              `<option value="${l.id}" ${l.remaining <= 0 ? "disabled" : ""}>` +
+              `${esc(l.code)} · ${esc(l.name)}（剩余 ${l.remaining}/${l.capacity}）</option>`
+          )
+          .join("")
+      : `<option value="">（暂无可用库位，请先在「库位管理」中创建）</option>`;
+    const hasTarget = candidates.some((l) => l.remaining > 0);
+    $("#mv-submit").disabled = !hasTarget;
+    $("#mv-submit").textContent = cur ? "转移到目标库位" : "放入目标库位";
+    $("#mv-target-hint").textContent = hasTarget
+      ? "仅列出有空位的库位（不含当前所在库位）；提交携带样本与库位版本做乐观锁校验"
+      : "当前没有有空位的库位，请先在左侧「样本库位管理」中创建";
+    $("#mv-checkout").hidden = !cur;
+
+    // 移动历史（不可变记录，新的在前）
+    const moves = state.data.location_moves || [];
+    $("#mv-history-tbody").innerHTML = moves.length
+      ? moves
+          .map(
+            (m, i) => `
+        <tr>
+          <td class="col-ord">${moves.length - i}</td>
+          <td>${esc(m.moved_at)}</td>
+          <td>${m.from_code ? esc(m.from_code) : '<span class="muted-cell">（未入库）</span>'}</td>
+          <td>${m.to_code ? esc(m.to_code) : '<span class="muted-cell">（移出库位）</span>'}</td>
+          <td>${esc(m.operator)}</td>
+          <td>${esc(m.note || "—")}</td>
+        </tr>`
+          )
+          .join("")
+      : `<tr><td colspan="6" class="muted-cell" style="text-align:center;padding:18px">暂无移动记录</td></tr>`;
+  }
+
+  async function submitMove(payload, okMsg) {
+    const btn = $("#mv-submit");
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/samples/${state.currentId}/location-move`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      // 服务端回传刷新后的样本 / 当前位置 / 移动历史 / 库位列表，直接渲染
+      state.data.sample = r.sample;
+      state.data.location = r.location;
+      state.data.location_moves = r.location_moves;
+      state.locations = r.locations;
+      renderAll();
+      toast(okMsg);
+    } catch (err) {
+      toast(err.message, true);
+      // 并发争抢 / 陈旧来源 / 版本过期（409）：以服务端最新状态刷新后由用户重试
+      if (err.status === 409 || err.status === 404) {
+        await reloadCurrentSample(state.currentId);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function movePayload(toLoc) {
+    const sample = curSample();
+    const cur = state.data.location || null;
+    return {
+      to_location_id: toLoc ? toLoc.id : null,
+      operator: $("#mv-operator").value.trim(),
+      note: $("#mv-note").value.trim(),
+      expected_sample_version: sample.version,
+      expected_from_location_id: cur ? cur.location_id : null,
+      expected_from_version: cur ? cur.location_version : null,
+      expected_to_version: toLoc ? toLoc.version : null,
+    };
+  }
+
+  // 放入 / 转移
+  $("#move-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const cur = state.data.location || null;
+    const targetId = Number($("#mv-target").value);
+    const toLoc = (state.locations || []).find((l) => l.id === targetId);
+    if (!toLoc) {
+      toast("请选择目标库位", true);
+      return;
+    }
+    if (!$("#mv-operator").value.trim()) {
+      toast("请填写操作人", true);
+      return;
+    }
+    await submitMove(
+      movePayload(toLoc),
+      `已${cur ? "转移" : "放入"}到库位 ${toLoc.code}（${toLoc.name}）`
+    );
+  });
+
+  // 移出库位（不进入新库位）
+  $("#mv-checkout").addEventListener("click", async () => {
+    const cur = state.data.location || null;
+    if (!cur) return;
+    if (!$("#mv-operator").value.trim()) {
+      toast("请填写操作人", true);
+      return;
+    }
+    if (!confirm(`确定将样本从库位 ${cur.code}（${cur.name}）移出？移出后样本不占任何库位。`))
+      return;
+    await submitMove(movePayload(null), `已移出库位 ${cur.code}`);
   });
 
   // ---------- 报告导出 ----------
