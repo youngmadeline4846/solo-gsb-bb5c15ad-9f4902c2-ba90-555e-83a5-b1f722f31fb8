@@ -243,6 +243,64 @@ CREATE TABLE IF NOT EXISTS aliquot_items (
 
 CREATE INDEX IF NOT EXISTS idx_aliquot_items_batch ON aliquot_items(batch_id);
 -- idx_samples_parent 在 _migrate() 补齐谱系列之后创建（旧库该列尚不存在）
+
+-- 样本库位管理：storage_locations 为物理存放位置（带唯一编号与容量）。
+-- occupied_count 为当前占用数，应用层在写事务内以条件 UPDATE 保证
+-- 0 <= occupied_count <= capacity（CHECK 兜底）；version 为库位级乐观锁，
+-- 每次成功放入 / 转移（占用数变化）+1。库位只提供创建 / 查询接口。
+CREATE TABLE IF NOT EXISTS storage_locations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    code            TEXT    NOT NULL UNIQUE,
+    name            TEXT    NOT NULL,
+    capacity        INTEGER NOT NULL CHECK (capacity > 0 AND capacity <= 100000),
+    occupied_count  INTEGER NOT NULL DEFAULT 0
+                    CHECK (occupied_count >= 0 AND occupied_count <= capacity),
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT    NOT NULL
+);
+
+-- 样本占位：每个样本至多一行（sample_id 为主键），即「每个样本最多占一个库位」。
+-- 库位外键 RESTRICT：已有移动 / 占位的库位不可被删除（应用层本就不提供删除）。
+-- 样本外键 CASCADE：删除样本时占位行随之清除（占用数由应用层在同事务同步扣减，
+-- 不能依赖 SQLite 触发器，保证 storage_locations.occupied_count 始终真实）。
+CREATE TABLE IF NOT EXISTS sample_storage (
+    sample_id    INTEGER PRIMARY KEY REFERENCES samples(id) ON DELETE CASCADE,
+    location_id  INTEGER NOT NULL REFERENCES storage_locations(id),
+    placed_at    TEXT    NOT NULL,
+    placed_by    TEXT    NOT NULL DEFAULT '',
+    last_move_id INTEGER,
+    created_at   TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_sample_storage_location ON sample_storage(location_id);
+
+-- 不可变移动记录：放入（from 为 NULL，action=store）/ 转移（action=transfer）
+-- 每成功一次写一行，无任何更新 / 删除接口；snapshot 固化移动前样本与源 / 目标
+-- 库位的版本快照，digest 为其 SHA-256。样本删除时记录随样本级联清除；
+-- 库位外键不加级联（只存快照代码即可追溯），因此库位物理上不可删除。
+CREATE TABLE IF NOT EXISTS storage_moves (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id              INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    sample_code            TEXT    NOT NULL,
+    action                 TEXT    NOT NULL CHECK (action IN ('store', 'transfer')),
+    from_location_id       INTEGER,
+    from_location_code     TEXT,
+    to_location_id         INTEGER NOT NULL REFERENCES storage_locations(id),
+    to_location_code       TEXT    NOT NULL,
+    operator               TEXT    NOT NULL,
+    moved_at               TEXT    NOT NULL,
+    note                   TEXT    NOT NULL DEFAULT '',
+    sample_version_before  INTEGER NOT NULL,
+    from_version_before    INTEGER,
+    to_version_before      INTEGER NOT NULL,
+    snapshot               TEXT    NOT NULL DEFAULT '',
+    digest                 TEXT    NOT NULL DEFAULT '',
+    created_at             TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_moves_sample ON storage_moves(sample_id);
+CREATE INDEX IF NOT EXISTS idx_storage_moves_to ON storage_moves(to_location_id);
+CREATE INDEX IF NOT EXISTS idx_storage_moves_from ON storage_moves(from_location_id);
 """
 
 
@@ -355,6 +413,7 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
 
     _seed_handovers(conn, sid, event_ids, rows, sid2, event_ids2, rows2, now)
     _seed_lineage(conn, sid, now)
+    _seed_storage(conn, sid, sid2, now)
 
 
 def _seed_lineage(conn: sqlite3.Connection, sid: int, now: str) -> None:
@@ -535,3 +594,78 @@ def _seed_handovers(
         "李四", "2026-01-01 10:02:00",
         ACTIVE,
     )
+
+
+def _seed_storage(
+    conn: sqlite3.Connection, sid: int, sid2: int, now: str
+) -> None:
+    """预置库位管理演示：两个库位、5 条不可变移动记录（含一次库位间转移）。
+
+    最终：LOC-FRZ-01（容量 3）放满（父样本 / 孙样本 / 子样本 B），
+    LOC-FRZ-02（容量 4）放入子样本 A 与完整链路样本，开箱即可看到
+    占用清单、当前位置与含「放入 -> 转移」的移动历史。
+    """
+    from .storage import _move_locked
+
+    if conn.execute("SELECT COUNT(*) FROM storage_locations").fetchone()[0] > 0:
+        return
+
+    def make_location(code, name, capacity: int) -> int:
+        cur = conn.execute(
+            "INSERT INTO storage_locations (code, name, capacity, occupied_count, "
+            "version, created_at) VALUES (?, ?, ?, 0, 1, ?)",
+            (code, name, capacity, now),
+        )
+        return cur.lastrowid
+
+    loc1 = make_location("LOC-FRZ-01", "−20℃ 冷冻柜 F-01（演示）", 3)
+    loc2 = make_location("LOC-FRZ-02", "2-8℃ 留样柜 R-02（演示）", 4)
+
+    def sample_version(sample_id: int) -> int:
+        return conn.execute(
+            "SELECT version FROM samples WHERE id = ?", (sample_id,)
+        ).fetchone()[0]
+
+    def sample_id_by_code(code: str) -> int:
+        return conn.execute(
+            "SELECT id FROM samples WHERE code = ?", (code,)
+        ).fetchone()["id"]
+
+    child_a = sample_id_by_code("SAM-DEMO-001-A")
+    child_b = sample_id_by_code("SAM-DEMO-001-B")
+    grand = sample_id_by_code("SAM-DEMO-001-A-1")
+
+    # 库位版本随移动递增：每步前现取，避免依赖固定版本序列
+    def move(seq_sample_id, frm, to, operator, moved_at, note=""):
+        f_ver = None
+        if frm is not None:
+            f_ver = conn.execute(
+                "SELECT version FROM storage_locations WHERE id = ?", (frm,)
+            ).fetchone()[0]
+        t_ver = conn.execute(
+            "SELECT version FROM storage_locations WHERE id = ?", (to,)
+        ).fetchone()[0]
+        _move_locked(
+            conn,
+            sample_id=seq_sample_id,
+            to_location_id=to,
+            from_location_id=frm,
+            operator=operator,
+            moved_at=moved_at,
+            note=note,
+            expected_sample_version=sample_version(seq_sample_id),
+            expected_from_version=f_ver,
+            expected_to_version=t_ver,
+        )
+
+    t0 = "2026-01-02 09:00:00"
+    # 父样本放入冷冻柜 F-01
+    move(sid, None, loc1, "赵六（留样管理员）", t0, "检测后入柜冻存")
+    # 子样本 A 放入 F-01，随后转移到留样柜 R-02（产生 store + transfer 两条历史）
+    move(child_a, None, loc1, "赵六（留样管理员）", "2026-01-02 09:20:00", "留样 60 mL 入柜")
+    move(child_a, loc1, loc2, "钱七（检测组）", "2026-01-03 10:00:00", "复检需要 2-8℃ 暂存")
+    # 孙样本与子样本 B 入 F-01，恰好放满 3/3
+    move(grand, None, loc1, "钱七（检测组）", "2026-01-03 10:30:00", "上机样本冻存")
+    move(child_b, None, loc1, "赵六（留样管理员）", "2026-01-03 11:00:00", "复检 30 mL 冻存")
+    # 完整链路样本放入 R-02
+    move(sid2, None, loc2, "周八（留样柜）", "2026-01-02 15:00:00", "仍在保管，入留样柜")

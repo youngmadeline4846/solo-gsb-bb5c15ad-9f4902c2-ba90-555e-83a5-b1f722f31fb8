@@ -86,11 +86,14 @@ from .schemas import (
     FindingDispose,
     FindingRelease,
     HandoverConfirm,
+    LocationCreate,
     SampleCreate,
+    SampleMoveCreate,
     SampleQuantityInit,
     SignoffCreate,
     SignoffRevoke,
 )
+from .storage import StorageError, detach_sample_storage, get_sample_storage, list_locations, list_moves, get_location_detail, create_location, move_sample
 
 
 @asynccontextmanager
@@ -188,6 +191,7 @@ def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str
         "handovers": build_handover_view(conn, sample_id),
         "attachments": list_sample_attachments(conn, sample_id),
         "lineage": build_lineage_tree(conn, sample_id),
+        "storage": get_sample_storage(conn, sample_id),
     }
 
 
@@ -205,6 +209,8 @@ def delete_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> Respo
     blocked = deletion_blocked_reason(conn, sample_id)
     if blocked:
         raise HTTPException(status_code=409, detail=blocked)
+    # 解除库位占位并同步占用数（不可变移动记录随样本外键级联清除）
+    detach_sample_storage(conn, sample_id)
     conn.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
     conn.commit()
     return Response(status_code=204)
@@ -274,6 +280,87 @@ def get_aliquot_batch(batch_id: int, conn: Connection = Depends(get_conn)) -> di
         return get_batch_detail(conn, batch_id)
     except AliquotError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+# ---------- 样本库位管理 ----------
+
+@app.post("/api/storage/locations", status_code=201)
+def create_storage_location(
+    payload: LocationCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """创建库位：编号全局唯一、容量为正整数；成功后返回库位（含空占用清单）。"""
+    try:
+        return create_location(conn, payload.code, payload.name, payload.capacity)
+    except StorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/storage/locations")
+def list_storage_locations(conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """全部库位：容量 / 占用 / 剩余、各库位占用清单与总览统计。"""
+    return list_locations(conn)
+
+
+@app.get("/api/storage/locations/{location_id}")
+def get_storage_location(
+    location_id: int, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """库位详情：容量占用 + 当前占用清单（样本编号 / 名称 / 放入时间）。"""
+    try:
+        return get_location_detail(conn, location_id)
+    except StorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/samples/{sample_id}/storage/move", status_code=201)
+def move_sample_storage(
+    sample_id: int, payload: SampleMoveCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """把样本放入目标库位，或从源库位转移到目标库位（每个样本最多占一个库位）。
+
+    服务端在单一 ``BEGIN IMMEDIATE`` 事务内校验样本当前库位（来源不能陈旧）、
+    目标剩余容量，以及样本 / 源库位 / 目标库位的 ``expected_version``；
+    成功后更新样本占位、源 / 目标占用数（版本 +1）与样本版本（+1），
+    并写入一条不可变移动记录。并发争抢最后空位、陈旧来源、版本过期均返回 409，
+    任何失败整体回滚，不产生重复占位、超容量或半条记录。
+    """
+    try:
+        return move_sample(
+            conn,
+            sample_id,
+            payload.to_location_id,
+            payload.from_location_id,
+            payload.operator,
+            payload.moved_at,
+            payload.note,
+            payload.expected_sample_version,
+            payload.expected_from_version,
+            payload.expected_to_version,
+        )
+    except StorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/samples/{sample_id}/storage")
+def get_sample_storage_route(
+    sample_id: int, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """样本当前位置（库位详情 + 放入时间）与该样本全部不可变移动记录。"""
+    try:
+        return get_sample_storage(conn, sample_id)
+    except StorageError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/storage/moves")
+def list_storage_moves(
+    sample_id: Optional[int] = Query(None, ge=1),
+    location_id: Optional[int] = Query(None, ge=1),
+    limit: int = Query(100, ge=1, le=500),
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """不可变移动历史（倒序）：可按样本 / 库位（源或目标）筛选。"""
+    return list_moves(conn, limit=limit, sample_id=sample_id, location_id=location_id)
 
 
 # ---------- 交接事件 ----------

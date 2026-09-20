@@ -129,23 +129,26 @@
     loadQueueBadge(); // 未处理数角标随样本 / 链路变化刷新
   }
 
-  // 主区域视图切换：样本详情 <-> 异常处置队列（跨样本）
+  // 主区域视图切换：样本详情 <-> 异常处置队列（跨样本）<-> 库位管理（跨库位）
   function setView(view) {
     state.view = view;
     $("#btn-queue").classList.toggle("active", view === "queue");
+    $("#btn-storage").classList.toggle("active", view === "storage");
     $("#queue-view").hidden = view !== "queue";
+    $("#storage-view").hidden = view !== "storage";
     if (view !== "queue") {
       // 离开队列视图时停止租约倒计时
       clearInterval(state.queue.countdownTimer);
       state.queue.countdownTimer = null;
     }
-    if (view === "queue") {
+    if (view === "queue" || view === "storage") {
       $("#detail").hidden = true;
       $("#empty-state").hidden = true;
       document
         .querySelectorAll("#sample-list li")
         .forEach((li) => li.classList.remove("active"));
     }
+    if (view === "storage") loadStorageView();
   }
 
   $("#sample-list").addEventListener("click", (e) => {
@@ -166,6 +169,7 @@
       state.editingId = null;
       linState.rows = [];
       $("#aliquot-form").reset();
+      await refreshStorageData();
       setView("sample");
       renderAll();
       $("#empty-state").hidden = true;
@@ -183,6 +187,7 @@
   function renderAll() {
     renderSample();
     renderLineage();
+    renderStorage();
     renderAudit();
     renderHandovers();
     renderTimeline();
@@ -1927,6 +1932,274 @@
   $("#btn-close-batch").addEventListener("click", () => (batchModal.hidden = true));
   batchModal.addEventListener("click", (e) => {
     if (e.target === batchModal) batchModal.hidden = true;
+  });
+
+  // ---------- 样本库位管理 ----------
+
+  const MOVE_ACTION_LABEL = { store: "放入", transfer: "转移" };
+  const storageState = { data: null }; // 库位管理视图最近一次 { locations, summary }
+
+  $("#btn-storage").addEventListener("click", () => setView("storage"));
+  $("#btn-storage-refresh").addEventListener("click", () => loadStorageView());
+  $("#btn-go-storage").addEventListener("click", () => setView("storage"));
+
+  async function loadStorageView() {
+    try {
+      const [locData, moveData] = await Promise.all([
+        api("/api/storage/locations"),
+        api("/api/storage/moves?limit=100"),
+      ]);
+      storageState.data = locData;
+      renderStorageOverview(locData);
+      renderStorageMoves(moveData.moves, $("#loc-moves-tbody"));
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  $("#loc-create-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const code = $("#lc-code").value.trim();
+    const name = $("#lc-name").value.trim();
+    const capacity = Number($("#lc-capacity").value);
+    if (!code || !name) return toast("请填写库位编号与名称", true);
+    if (!Number.isInteger(capacity) || capacity < 1) return toast("容量必须是正整数", true);
+    try {
+      const loc = await api("/api/storage/locations", {
+        method: "POST",
+        body: JSON.stringify({ code, name, capacity }),
+      });
+      toast(`库位 ${loc.code} 已创建（容量 ${loc.capacity}）`);
+      $("#loc-create-form").reset();
+      await loadStorageView();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
+  function locOccupancyBar(loc) {
+    const pct = Math.min(100, Math.round((loc.occupied_count / loc.capacity) * 100));
+    const cls = loc.remaining === 0 ? "loc-bar-full" : loc.remaining === 1 ? "loc-bar-near" : "";
+    return `
+      <div class="loc-bar" title="占用 ${loc.occupied_count}/${loc.capacity}">
+        <div class="loc-bar-fill ${cls}" style="width:${pct}%"></div>
+      </div>`;
+  }
+
+  function renderStorageOverview(data) {
+    const s = data.summary;
+    $("#loc-stats").innerHTML = [
+      statPill(s.location_count, "个库位"),
+      statPill(s.capacity, "总容量"),
+      statPill(s.occupied, "已占用", s.occupied ? "" : "muted"),
+      statPill(s.remaining, "剩余空位", s.remaining ? "ok" : "bad"),
+    ].join("");
+
+    $("#loc-list").innerHTML = data.locations
+      .map(
+        (loc) => `
+      <div class="loc-card ${loc.remaining === 0 ? "full" : ""}">
+        <div class="loc-card-head">
+          <div>
+            <span class="s-code">${esc(loc.code)}</span>
+            <span class="lin-name">${esc(loc.name)}</span>
+            ${loc.remaining === 0 ? '<span class="finding-tag finding-tag-reversed_interval">已满</span>' : ""}
+          </div>
+          <div class="loc-cap">
+            <b>${loc.occupied_count}</b>/${loc.capacity} 占用 · 剩余 <b>${loc.remaining}</b>
+            <span class="muted-cell">v${loc.version}</span>
+          </div>
+        </div>
+        ${locOccupancyBar(loc)}
+        <div class="table-wrap">
+          <table class="event-table loc-occ-table">
+            <thead><tr><th>样本编号</th><th>样本名称</th><th>放入时间</th><th>放入人</th><th>操作</th></tr></thead>
+            <tbody>
+              ${
+                loc.occupants.length
+                  ? loc.occupants
+                      .map(
+                        (o) => `
+                <tr>
+                  <td><span class="s-code">${esc(o.code)}</span></td>
+                  <td>${esc(o.name)}</td>
+                  <td>${esc(o.placed_at)}</td>
+                  <td>${esc(o.placed_by || "—")}</td>
+                  <td><button class="link-btn btn-edit" data-loc-sample="${o.sample_id}">打开样本</button></td>
+                </tr>`
+                      )
+                      .join("")
+                  : '<tr><td colspan="5" class="muted-cell">空位，暂无样本</td></tr>'
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>`
+      )
+      .join("");
+  }
+
+  $("#loc-list").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-loc-sample]");
+    if (btn) await selectSample(Number(btn.dataset.locSample));
+  });
+
+  function moveRowHtml(m, includeSample) {
+    const sampleCell = includeSample
+      ? `<td><button class="link-btn" data-move-sample="${m.sample_id}">${esc(m.sample_code)}</button></td>`
+      : "";
+    return `
+      <tr>
+        <td class="col-ord">${m.id}</td>
+        ${sampleCell}
+        <td><span class="finding-tag ${m.action === "store" ? "finding-tag-out_of_order" : "finding-tag-gap"}">${MOVE_ACTION_LABEL[m.action] || m.action}</span></td>
+        <td>${m.from_location_code ? esc(m.from_location_code) : '<span class="muted-cell">—（库外）</span>'}</td>
+        <td><b>${esc(m.to_location_code)}</b></td>
+        <td>${esc(m.operator)}</td>
+        <td>${esc(m.moved_at)}</td>
+        <td>${esc(m.note || "—")}</td>
+        <td class="${m.integrity_ok ? "integrity-ok" : "integrity-bad"}" title="样本 v${m.sample_version_before} · 源 v${m.from_version_before ?? "—"} · 目标 v${m.to_version_before}">${m.integrity_ok ? "✓" : "✗"} ${esc(m.digest.slice(0, 10))}</td>
+      </tr>`;
+  }
+
+  function renderStorageMoves(moves, tbody, includeSample = true) {
+    const colspan = includeSample ? 9 : 8;
+    if (!moves.length) {
+      tbody.innerHTML = `<tr><td colspan="${colspan}" class="muted-cell">暂无移动记录</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = moves.map((m) => moveRowHtml(m, includeSample)).join("");
+  }
+
+  $("#loc-moves-tbody").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-move-sample]");
+    if (btn) await selectSample(Number(btn.dataset.moveSample));
+  });
+
+  // ---- 样本详情内的库位卡 ----
+
+  function renderStorage() {
+    const sample = curSample();
+    if (!sample) return;
+    const st = state.data.storage;
+    if (!st) return;
+    const cur = st.current;
+
+    $("#st-current").innerHTML = cur
+      ? [
+          statChip(cur.code, "当前库位", "ok"),
+          statChip(`${cur.occupied_count}/${cur.capacity}`, "库位占用", cur.remaining === 0 ? "bad" : ""),
+          statChip(cur.remaining, "该库位剩余空位", cur.remaining ? "ok" : "bad"),
+          statChip(st.sample_version, "样本版本", "muted"),
+          `<span class="ho-stat muted"><b>放入时间</b> ${esc(cur.placed_at || "—")} · ${esc(cur.placed_by || "—")}</span>`,
+        ].join("")
+      : [
+          statChip("库外", "当前库位", "bad"),
+          statChip(st.sample_version, "样本版本", "muted"),
+          `<span class="ho-stat warn"><b>该样本尚未入库</b> 选择目标库位后执行放入</span>`,
+        ].join("");
+
+    const btn = $("#btn-move-submit");
+    btn.textContent = cur ? "转移到目标库位" : "放入目标库位";
+
+    // 目标库位下拉：库外放入时全部可选；转移时排除当前所在库位
+    const locs = (storageState.data && storageState.data.locations) || [];
+    $("#mv-to").innerHTML = locs
+      .filter((l) => !cur || l.id !== cur.id)
+      .map(
+        (l) =>
+          `<option value="${l.id}" ${l.remaining === 0 ? "disabled" : ""}>` +
+          `${esc(l.code)} · ${esc(l.name)}（剩余 ${l.remaining}/${l.capacity}，v${l.version}）` +
+          (l.remaining === 0 ? "（已满）" : "") +
+          `</option>`
+      )
+      .join("");
+    if (!locs.length) {
+      $("#mv-to").innerHTML = `<option value="" disabled selected>请先在「库位管理」中创建库位</option>`;
+      btn.disabled = true;
+    } else {
+      btn.disabled = false;
+    }
+
+    $("#mv-version-hint").textContent = cur
+      ? `提交将校验：样本当前位于 ${cur.code}（源 v${cur.version}）、样本 v${st.sample_version}、目标库位所选版本；任一不符返回 409 并自动刷新。`
+      : `提交将校验：样本当前不在任何库位、样本 v${st.sample_version} 与目标库位所选版本；任一不符返回 409 并自动刷新。`;
+
+    renderStorageMoves(st.history, $("#st-history-tbody"), false);
+  }
+
+  // 库位下拉 / 视图所需的库位清单：进入样本与冲突重试时刷新，保证版本最新
+  async function refreshStorageData() {
+    try {
+      storageState.data = await api("/api/storage/locations");
+    } catch (_) {
+      storageState.data = { locations: [] };
+    }
+  }
+
+  $("#storage-move-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const sample = curSample();
+    const st = state.data.storage;
+    const cur = st.current;
+    const toId = Number($("#mv-to").value);
+    if (!toId) return toast("请选择目标库位", true);
+    const operator = $("#mv-operator").value.trim();
+    if (!operator) return toast("请填写操作人", true);
+    const target = (storageState.data.locations || []).find((l) => l.id === toId);
+    if (!target) return toast("目标库位信息缺失，请刷新后重试", true);
+
+    const payload = {
+      to_location_id: toId,
+      from_location_id: cur ? cur.id : null,
+      expected_sample_version: st.sample_version,
+      expected_from_version: cur ? cur.version : null,
+      expected_to_version: target.version,
+      operator,
+      moved_at: $("#mv-at").value || null,
+      note: $("#mv-note").value.trim(),
+    };
+    if (
+      !confirm(
+        `确认${cur ? "将 " + sample.code + " 从 " + cur.code + " 转移到 " : "将 " + sample.code + " 放入 "}${target.code}？\n` +
+          "服务端在单一事务内校验当前来源、目标剩余容量与样本/源/目标版本，\n" +
+          "成功后更新占用数、样本版本并写入不可变移动记录。"
+      )
+    )
+      return;
+    const btn = $("#btn-move-submit");
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/samples/${sample.id}/storage/move`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const m = r.move;
+      toast(
+        `${MOVE_ACTION_LABEL[m.action]}成功：${m.from_location_code || "库外"} → ${m.to_location_code}（目标剩余 ${r.to.remaining}）`
+      );
+      $("#mv-at").value = "";
+      $("#mv-note").value = "";
+      // 用响应中的新版本即时刷新，随后以服务端权威数据全量刷新
+      storageState.data = null;
+      await refreshStorageData();
+      await reloadCurrentSample(sample.id);
+    } catch (err) {
+      toast(err.message, true);
+      // 陈旧来源 / 版本过期 / 容量争抢（409）：按服务端最新状态刷新后再试
+      if (err.status === 409 || err.status === 404) {
+        storageState.data = null;
+        await refreshStorageData();
+        await reloadCurrentSample(sample.id);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("#st-history-tbody").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-move-sample]");
+    if (btn) await selectSample(Number(btn.dataset.moveSample));
   });
 
   // ---------- 报告导出 ----------

@@ -322,3 +322,67 @@ class AliquotCreate(BaseModel):
         if dup:
             raise ValueError(f"子样本编号在本次请求中重复：{'、'.join(sorted(dup))}")
         return self
+
+
+# ---------- 样本库位管理 ----------
+
+class LocationCreate(BaseModel):
+    """创建库位：唯一编号 + 容量（可容纳样本数，正整数）。"""
+
+    code: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=128)
+    capacity: int = Field(..., ge=1, le=100_000)
+
+    @field_validator("code", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+
+class SampleMoveCreate(BaseModel):
+    """样本放入 / 转移到目标库位。
+
+    * ``from_location_id`` 为 null 表示首次放入（样本此前不在任何库位）；
+    * 转移时必须给出当前源库位 id 与源库位版本 ``expected_from_version``；
+    * 始终携带样本版本与目标库位版本（乐观锁）；服务端在单一
+      ``BEGIN IMMEDIATE`` 事务内校验当前来源、剩余容量与三者版本，
+      陈旧来源 / 争抢空位 / 版本过期均返回 409。
+    """
+
+    to_location_id: int = Field(..., ge=1)
+    from_location_id: Optional[int] = Field(None, ge=1)
+    expected_sample_version: int = Field(..., ge=0)
+    expected_to_version: int = Field(..., ge=1)
+    expected_from_version: Optional[int] = Field(None, ge=1)
+    operator: str = Field(..., min_length=1, max_length=64)
+    moved_at: Optional[str] = None
+    note: str = Field("", max_length=512)
+
+    @model_validator(mode="after")
+    def _check_from_version(self) -> "SampleMoveCreate":
+        if self.from_location_id is not None and self.expected_from_version is None:
+            raise ValueError("转移必须携带源库位版本号 expected_from_version")
+        if self.from_location_id is None and self.expected_from_version is not None:
+            raise ValueError("首次放入（from_location_id 为空）不应携带源库位版本")
+        return self
+
+    @field_validator("operator")
+    @classmethod
+    def _strip_operator(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("操作人不能为空")
+        return v
+
+    @field_validator("moved_at")
+    @classmethod
+    def _norm_moved_at(cls, v):
+        return _normalize_time(v, "移动时间")
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()

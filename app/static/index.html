@@ -30,6 +30,9 @@
         <span class="qe-icon">🚨</span> 异常处置队列
         <span id="queue-badge" class="queue-badge" hidden>0</span>
       </button>
+      <button id="btn-storage" class="queue-entry" type="button">
+        <span class="qe-icon">🧊</span> 样本库位管理
+      </button>
       <ul id="sample-list" class="sample-list"></ul>
     </aside>
 
@@ -115,6 +118,64 @@
         </section>
       </div>
 
+      <!-- 样本库位管理（跨库位视图） -->
+      <div id="storage-view" class="detail" hidden>
+        <section class="card">
+          <div class="card-head">
+            <h3>样本库位管理</h3>
+            <span class="head-hint">创建带唯一编号与容量的库位；每个样本最多占一个库位，放入 / 转移在单一事务内校验来源、剩余容量与三方版本，争抢最后空位返回 409</span>
+          </div>
+
+          <!-- 新建库位 -->
+          <form id="loc-create-form" class="event-form">
+            <div class="form-grid form-grid-3">
+              <label>库位编号
+                <input type="text" id="lc-code" maxlength="64" placeholder="唯一，如 LOC-FRZ-03" required />
+              </label>
+              <label>库位名称
+                <input type="text" id="lc-name" maxlength="128" placeholder="如：−20℃ 冷冻柜 F-03" required />
+              </label>
+              <label>容量（可容纳样本数）
+                <input type="number" id="lc-capacity" min="1" max="100000" step="1" placeholder="正整数，如 12" required />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">＋ 创建库位</button>
+              <button type="button" id="btn-storage-refresh" class="btn btn-ghost">↻ 刷新</button>
+            </div>
+          </form>
+
+          <div id="loc-stats" class="handover-stats"></div>
+          <div id="loc-list" class="loc-list"></div>
+        </section>
+
+        <!-- 移动历史（全局） -->
+        <section class="card">
+          <div class="card-head">
+            <h3>移动历史（不可变）</h3>
+            <span class="head-hint">放入与转移每成功一次写一条记录，附移动前版本快照与 SHA-256，任何接口不可修改 / 删除</span>
+          </div>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>样本</th>
+                  <th>动作</th>
+                  <th>源库位</th>
+                  <th>目标库位</th>
+                  <th>操作人</th>
+                  <th>移动时间</th>
+                  <th>备注</th>
+                  <th>快照</th>
+                </tr>
+              </thead>
+              <tbody id="loc-moves-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
       <div id="detail" class="detail" hidden>
         <!-- 样本信息卡 -->
         <section class="card sample-card">
@@ -192,6 +253,59 @@
           <div class="lin-tree-wrap">
             <div class="lin-tree-lbl">来源 / 批次 / 分装量 / 剩余量（点击样本可跳转继续分装；点击批次号查看不可变批次详情）</div>
             <div id="lin-tree" class="lin-tree"></div>
+          </div>
+        </section>
+
+        <!-- 样本库位 -->
+        <section class="card">
+          <div class="card-head">
+            <h3>样本库位</h3>
+            <span class="head-hint">每个样本最多占一个库位；提交携带样本与源 / 目标库位版本，来源过期、目标已满或版本冲突均返回 409 且无半条记录</span>
+          </div>
+          <div id="st-current" class="lin-current"></div>
+          <form id="storage-move-form" class="event-form">
+            <div class="form-grid form-grid-3">
+              <label>目标库位
+                <select id="mv-to" required></select>
+              </label>
+              <label>操作人
+                <input type="text" id="mv-operator" maxlength="64" placeholder="如：留样管理员 赵六" required />
+              </label>
+              <label>移动时间
+                <input type="datetime-local" id="mv-at" step="1" />
+                <small>留空使用服务端当前时间</small>
+              </label>
+            </div>
+            <div class="form-grid">
+              <label class="form-note">备注
+                <input type="text" id="mv-note" maxlength="512" placeholder="可选，如：复检需要 2-8℃ 暂存" />
+              </label>
+            </div>
+            <div id="mv-version-hint" class="lin-version-hint"></div>
+            <div class="form-actions">
+              <button type="submit" id="btn-move-submit" class="btn btn-primary">放入 / 转移到目标库位</button>
+              <button type="button" id="btn-go-storage" class="btn btn-ghost">🧊 打开库位管理</button>
+            </div>
+          </form>
+          <div class="lin-tree-wrap">
+            <div class="lin-tree-lbl">移动历史（不可变记录，新→旧；含移动前样本与源 / 目标库位版本）</div>
+            <div class="table-wrap">
+              <table class="event-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>动作</th>
+                    <th>源库位</th>
+                    <th>目标库位</th>
+                    <th>操作人</th>
+                    <th>移动时间</th>
+                    <th>备注</th>
+                    <th>SHA-256</th>
+                  </tr>
+                </thead>
+                <tbody id="st-history-tbody"></tbody>
+              </table>
+            </div>
           </div>
         </section>
 
